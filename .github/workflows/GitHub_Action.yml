@@ -1,78 +1,103 @@
-name: export-and-branch-solution
-# Export solution from DEV environment
-#  unpack it and prepare, commit and push a git branch with the changes
-
+name: Download, unpack and commit the solution to git
+run-name: Getting ${{ github.event.inputs.solution_name }} from pipelines host environment and committing
 on:
   workflow_dispatch:
     inputs:
-      # Change this value
+      artifact_url:
+        description: "The url of the Dataverse record ID for the artifact created by the pipelines (Example: https://[your-env].crm.dynamics.com/api/data/v9.0/deploymentartifacts([your-artifact-id])/artifactfile/$value)."
+        required: true
       solution_name:
-        description: 'name of the solution to worked on from Power Platform'
+        description: "Name of the Solution in Dataverse environment"
         required: true
-        default: ALMLab
-       #Do Not change these values
-      solution_exported_folder:
-        description: 'folder name for staging the exported solution *do not change*'
+      user_name: 
+        description: "User name for the commit"
         required: true
-        default: out/exported/
-      solution_folder:
-        description: 'staging the unpacked solution folder before check-in *do not change*'
+      source_branch:
+        description: "Branch for the solution commit"
         required: true
-        default: out/solutions/
-      solution_target_folder: 
-       description: 'folder name to be created and checked in *do not change*'
-       required: true
-       default: solutions/
-env:
-#edit your values here
-  ENVIRONMENT_URL: 'https://vnsemtst.crm5.dynamics.com'
-  CLIENT_ID: '721f671e-906b-4c12-9769-fe7c2764ed6a'
-  TENANT_ID: '66e853de-ece3-44dd-9d66-ee6bdf4159d4'
+      target_branch:
+        description: "Branch to create for the solution commit"
+        required: false
+      commit_message:
+        description: "Message to provide for the commit"
+        required: true
 permissions:
   contents: write
 jobs:
-  export-from-dev:
-    runs-on: windows-latest
-    # or you can say runs-on: ubuntu-latest
-    env:
-      RUNNER_DEBUG: 1
+  export-unpack-commit:
+    runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-      with:
-        lfs: true
+      - uses: actions/checkout@v3
+        with:
+            ref: ${{ github.event.inputs.source_branch }}
 
-    - name: who-am-i action
-      uses: microsoft/powerplatform-actions/who-am-i@v0
-      with:
-        environment-url: ${{env.ENVIRONMENT_URL}}
-        app-id: ${{env.CLIENT_ID}}
-        client-secret: ${{ secrets.PowerPlatformSPN }}
-        tenant-id: ${{env.TENANT_ID}}
+      # Commit changes to the existing or new branch
+      - name: create new branch if specified
+        shell: pwsh
+        run: |
+            if('${{ github.event.inputs.target_branch }}' -ne '') {
+                git checkout -b ${{ github.event.inputs.target_branch }} ${{ github.event.inputs.source_branch }}
+            }
 
+      # Export the solution from the artifact created by pipelines
+      - name: download solution from artifact
+        env:
+            CLIENT_ID: ${{secrets.CLIENT_ID}}   
+            TENANT_ID: ${{secrets.TENANT_ID}}   
+            CLIENT_SECRET: ${{secrets.CLIENT_SECRET}}
+        shell: pwsh
+        run: |
+            $aadHost = "login.microsoftonline.com"
+            $url = "${{ github.event.inputs.artifact_url }}"
+            $options = [System.StringSplitOptions]::RemoveEmptyEntries
+            $dataverseHost = $url.Split("://", $options)[1].Split("/")[0]
 
-    - name: export-solution action
-      uses: microsoft/powerplatform-actions/export-solution@v0
-      with:
-        environment-url: ${{env.ENVIRONMENT_URL}}
-        app-id: ${{env.CLIENT_ID}}
-        client-secret: ${{ secrets.PowerPlatformSPN }}
-        tenant-id: ${{env.TENANT_ID}}
-        solution-name: ${{ github.event.inputs.solution_name }}
-        solution-output-file: ${{ github.event.inputs.solution_exported_folder}}/${{ github.event.inputs.solution_name }}.zip
+            $body = @{client_id = $env:CLIENT_ID; client_secret = $env:CLIENT_SECRET; grant_type = "client_credentials"; scope = "https://$dataverseHost/.default"; }
+            $OAuthReq = Invoke-RestMethod -Method Post -Uri "https://$aadHost/$env:TENANT_ID/oauth2/v2.0/token" -Body $body
+            $spnToken = $OAuthReq.access_token
+            $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+            $headers.Add("Authorization", "Bearer $spnToken")
+            $headers.Add("Content-Type", "application/json")
 
-    - name: unpack-solution action
-      uses: microsoft/powerplatform-actions/unpack-solution@v0
-      with:
-        solution-file: ${{ github.event.inputs.solution_exported_folder}}/${{ github.event.inputs.solution_name }}.zip
-        solution-folder: ${{ github.event.inputs.solution_folder}}/${{ github.event.inputs.solution_name }}
-        solution-type: 'Unmanaged'
-        overwrite-files: true
+            # Download the managed solution
+            $response = Invoke-RestMethod "${{ github.event.inputs.artifact_url }}" -Method 'GET' -Headers $headers
+            $bytes = [Convert]::FromBase64String($response.value)
+            [IO.File]::WriteAllBytes("${{ github.event.inputs.solution_name }}_managed.zip", $bytes)
 
-    - name: branch-solution, prepare it for a PullRequest
-      uses: microsoft/powerplatform-actions/branch-solution@v0
-      with:
-        solution-folder: ${{ github.event.inputs.solution_folder}}/${{ github.event.inputs.solution_name }}
-        solution-target-folder: ${{ github.event.inputs.solution_target_folder}}/${{ github.event.inputs.solution_name }}
-        repo-token: ${{ secrets.GITHUB_TOKEN }}
-        allow-empty-commit: true
+            # Download the unmanaged solution (for now we will need to use string manipulation to get the unmanaged solution URL, until the API provides this value)
+            $unmanaged_artifact_url = "${{ github.event.inputs.artifact_url }}".Replace("artifactfile", "artifactfileunmanaged")
+            $response = Invoke-RestMethod "$unmanaged_artifact_url" -Method 'GET' -Headers $headers
+            $bytes = [Convert]::FromBase64String($response.value)
+            [IO.File]::WriteAllBytes("${{ github.event.inputs.solution_name }}.zip", $bytes)
+
+      # Unpack the solution
+      - name: unpack solution
+        uses: microsoft/powerplatform-actions/unpack-solution@v0
+        with:
+          solution-file: "${{ github.event.inputs.solution_name }}.zip"
+          solution-folder: "${{ github.event.repository.name }}"
+          solution-type: 'Both'
+          process-canvas-apps: false
+          overwrite-files: true
+
+      # Commit changes to the existing or new branch
+      - name: commit changes
+        shell: pwsh
+        run: |
+          rm -rf ${{ github.event.inputs.solution_name }}.zip
+          rm -rf ${{ github.event.inputs.solution_name }}_managed.zip
+          git config user.name ${{ github.event.inputs.user_name }}
+          git pull 
+          git add --all
+          git commit -am "${{ github.event.inputs.commit_message }}" --allow-empty
+
+      # Push the committed changes to the source branch
+      - name: push to branch
+        shell: pwsh
+        run: |
+          if('${{ github.event.inputs.target_branch }}' -ne '') {
+              git push origin ${{ github.event.inputs.target_branch }}
+          } else {
+              git push origin ${{ github.event.inputs.source_branch }}
+          }
