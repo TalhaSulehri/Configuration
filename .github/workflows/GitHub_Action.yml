@@ -1,4 +1,4 @@
-name: Download, unpack and commit the solution to git
+name: Git Actions
 run-name: Getting ${{ github.event.inputs.solution_name }} from pipelines host environment and committing
 on:
   workflow_dispatch:
